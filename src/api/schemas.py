@@ -3,6 +3,11 @@ from typing import List, Optional
 
 class QueryRequest(BaseModel):
     question: str = Field(..., description="A pergunta a ser feita para o RAG.")
+    provider: Optional[str] = Field(
+        default=None,
+        description="Motor de LLM: ollama | gemini | grok | groq. Omitido = padrão do .env"
+    )
+    model: Optional[str] = Field(default=None, description="Modelo dentro do provider")
     session_id: str = Field("default_session", description="O ID da sessão no Redis para resgatar a memória da conversa.")
     
 class QueryResponse(BaseModel):

@@ -15,6 +15,8 @@ import requests
 from dotenv import load_dotenv
 
 # Carrega configurações do .env se existir
+from .llm_factory import get_llm, resolve_model, resolve_provider
+
 load_dotenv()
 
 
@@ -91,7 +93,7 @@ DB_DIR = os.path.join(PROJECT_ROOT, "data", "vector_db")
 UPLOADS_DIR = os.path.join(PROJECT_ROOT, "data", "uploads")
 
 class RagEngine:
-    def __init__(self):
+    def __init__(self, provider: str = None, model: str = None):
         os.makedirs(DB_DIR, exist_ok=True)
         os.makedirs(UPLOADS_DIR, exist_ok=True)
         
@@ -106,11 +108,10 @@ class RagEngine:
                 model=EMBEDDING_MODEL,
                 base_url=OLLAMA_BASE_URL
             )
-            self.llm = ChatOllama(
-                model=LLM_MODEL, 
-                temperature=0.1,
-                base_url=OLLAMA_BASE_URL
-            )
+            # provider/modelo vêm da fábrica: sem argumento, usa LLM_PROVIDER do .env.
+            self.provider = resolve_provider(provider)
+            self.model_name = resolve_model(self.provider, model)
+            self.llm = get_llm(self.provider, self.model_name, temperature=0.1)
             self.vectorstore = Chroma(
                 persist_directory=DB_DIR, 
                 embedding_function=self.embeddings
@@ -271,4 +272,17 @@ class RagEngine:
             return False
 
 # Instância Singleton Engine
+# Instância padrão (provider do .env), mantida para o código existente.
 rag_engine_instance = RagEngine()
+
+# Cache por combinação provider+modelo: montar o motor é caro, e trocar de
+# motor na tela não pode devolver o motor antigo.
+_motores: dict = {}
+
+
+def get_engine(provider: str = None, model: str = None) -> RagEngine:
+    """Motor da combinação pedida. Sem argumentos, usa o padrão do .env."""
+    chave = (resolve_provider(provider), resolve_model(resolve_provider(provider), model))
+    if chave not in _motores:
+        _motores[chave] = RagEngine(provider=chave[0], model=chave[1])
+    return _motores[chave]

@@ -6,7 +6,17 @@ import shutil
 
 # Importações dos modelos e engine (local do projeto src/)
 from .api.schemas import QueryRequest, QueryResponse, HealthResponse
-from .core.rag_engine import rag_engine_instance, UPLOADS_DIR
+from .core.rag_engine import rag_engine_instance, get_engine, UPLOADS_DIR
+from .core.llm_factory import (
+    LLMConfigError,
+    PROVIDERS,
+    describe_provider,
+    list_provider_status,
+    modelos_ollama,
+    probe_provider,
+    resolve_provider,
+)
+
 
 # Inicialização do App FastAPI
 app = FastAPI(
@@ -24,6 +34,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+
+@app.get("/providers", tags=["LLM"])
+async def providers(probe: bool = False):
+    """
+    Motores de LLM e o estado de cada um.
+
+    `?probe=true` faz uma chamada real — única forma de detectar conta sem
+    crédito ou chave revogada. Também devolve os modelos instalados no Ollama
+    para a tela oferecer a lista em vez de campo livre.
+    """
+    if probe:
+        status = []
+        for nome in PROVIDERS:
+            try:
+                status.append(probe_provider(nome))
+            except LLMConfigError:
+                status.append(describe_provider(nome))
+    else:
+        status = list_provider_status()
+
+    return {
+        "default": resolve_provider(),
+        "providers": [vars(s) for s in status],
+        "ollama_models": modelos_ollama(),
+    }
 
 @app.get("/", tags=["Basic"])
 async def root():
@@ -86,7 +122,8 @@ async def perform_query(request: QueryRequest):
         raise HTTPException(status_code=503, detail="RAG Engine não inicializou adequadamente. Verifique se o Ollama está rodando.")
         
     try:
-        retorno = rag_engine_instance.query(request.question, request.session_id)
+        motor = get_engine(request.provider, request.model) if (request.provider or request.model) else rag_engine_instance
+        retorno = motor.query(request.question, request.session_id)
         return QueryResponse(
             answer=retorno["answer"],
             sources=retorno["sources"]

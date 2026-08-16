@@ -1,189 +1,200 @@
-# 🧠 RAG com Memória Contextual (Redis) — GIULIA AI
+# PRJ-02 — Memory RAG
 
-> Pipeline RAG local-first integrado com RedisChatMessageHistory e RunnableWithMessageHistory para persistência de histórico de chat e isolamento estrito de sessões multi-usuário.
+Segundo projeto de uma progressão de 8 técnicas de RAG (PRJ-01 a PRJ-08, orquestradas por um 9º projeto de deploy): evolui o Vanilla RAG (PRJ-01) adicionando memória de conversação persistente por sessão.
 
-[![Python Version](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![LangChain](https://img.shields.io/badge/LangChain-v0.1.0-FF6F00?style=flat-square)](https://github.com/langchain-ai/langchain)
-[![Redis](https://img.shields.io/badge/Redis-v5.0.0-DC382D?style=flat-square&logo=redis&logoColor=white)](https://redis.io/)
-[![Giulia AI](https://img.shields.io/badge/GIULIA%20AI-Ecosystem-blueviolet?style=flat-square)](https://github.com/wganalytics)
-[![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
+## Visão geral
 
----
+O PRJ-01 respondia cada pergunta isoladamente: sem histórico, sem contexto entre mensagens. Isso quebra qualquer conversa real, porque perguntas de acompanhamento ("e sobre isso, o que mais diz o documento?") dependem do que foi perguntado antes.
 
-## 📋 O que é o projeto
+O PRJ-02 resolve isso guardando o histórico de cada conversa no Redis, indexado por `session_id`. A cada pergunta, a chain do LangChain recupera o histórico da sessão, injeta como contexto de conversa e só então busca os trechos relevantes no ChromaDB — a memória de curto prazo (o que já foi dito) e a memória de longo prazo (o conteúdo do PDF) operam em conjunto, mas com papéis diferentes: o histórico ajuda a entender a pergunta, o documento continua sendo a única fonte da resposta.
 
-Em sistemas tradicionais de QA baseados em RAG, cada requisição é tratada de forma isolada e estática. Quando um usuário faz uma pergunta de acompanhamento (follow-up query), como *"Por que isso ocorre?"* logo após perguntar *"O que é fotossíntese?"*, a inferência falha por falta de contexto histórico. Manter o histórico do chat de forma escalável e segura sem vazamento de dados entre usuários concorrentes é o problema central abordado neste projeto.
+Nesta fase do projeto também foi adicionado suporte multi-provider de LLM: a geração de texto pode rodar em Ollama (local, sem custo), Google Gemini, xAI Grok ou Groq Cloud, escolhido por requisição. Os embeddings continuam fixos no Ollama — trocar o modelo de embedding invalidaria o banco vetorial já indexado.
 
-Este repositório fornece uma solução robusta e local-first implementando **Redis** como camada de persistência de memória conversacional (`RedisChatMessageHistory`) acoplada ao ecossistema **LangChain**. Através do uso de `RunnableWithMessageHistory`, o pipeline de RAG gerencia automaticamente a injeção do histórico de conversa e a recuperação de novos contextos no vector store de forma transparente e isolada.
+## Funcionalidades
 
-O grande diferencial arquitetural reside no desacoplamento estrito através de identificadores únicos (`session_id`). Isso garante isolamento hermético entre sessões de conversação paralelas, eliminando qualquer risco de contaminação cruzada de informações em ambientes multitenant, mantendo a performance rápida com tempo de recuperação inferior a 0.05 segundos para as sessões de chat em Redis.
+- Upload de PDF com extração, chunking e indexação vetorial (`POST /upload_pdf`).
+- Chat com memória de conversação persistente por `session_id`, armazenada no Redis (`POST /chat`).
+- Listagem e remoção de documentos indexados (`GET /list_docs`, `DELETE /remove_doc`).
+- Reset completo da base vetorial e dos uploads (`POST /clear_db`).
+- Seleção de motor de LLM por requisição — `provider` e `model` opcionais no corpo do chat, com fallback para o padrão do `.env`.
+- Diagnóstico de providers com dois níveis: configuração (chave e SDK presentes) e verificação (uma chamada real respondeu) — `GET /providers`.
+- Cache de motores por combinação `(provider, model)`: trocar de motor na interface não descarta o motor anterior nem remonta a chain a cada pergunta.
+- Interface Streamlit com upload, listagem/remoção de documentos, chat com fontes citadas e seletor de motor de LLM que testa cada provider ao carregar a tela e só oferece os que respondem.
 
----
-
-## 📐 Arquitetura do Sistema
+## Arquitetura
 
 ```mermaid
-graph TD
-    User["🙋 Usuário / Streamlit UI"] -->|"1. Envia Query + Session ID"| API["⚡ FastAPI /chat Endpoint"]
-    API -->|"2. Verifica Session ID"| RagEngine["⚙️ RagEngine (Singleton)"]
-    
-    subgraph Memória Conversacional
-        RagEngine ↔|"3. Recupera/Salva Histórico"| RedisHistory["🔴 RedisChatMessageHistory"]
-        RedisHistory ↔|"Salva Chaves por UUID"| RedisDB[("Redis Server (Port 6379)")]
-    end
-    
-    subgraph Base de Conhecimento Vetorial
-        RagEngine -->|"4. Busca Contexto (MMR k=5)"| ChromaDB[("🗄️ ChromaDB (Local Store)")]
+flowchart TD
+    UI["Streamlit\nfrontend/streamlit_app.py"] -->|upload PDF, pergunta, session_id| API["FastAPI\nsrc/main.py"]
+
+    subgraph Ingestao["Ingestão de documentos"]
+        API -->|POST /upload_pdf| Loader["PyMuPDFLoader + RecursiveCharacterTextSplitter"]
+        Loader --> Embed["OllamaEmbeddings"]
+        Embed --> Chroma[("ChromaDB\ndata/vector_db")]
     end
 
-    subgraph Inferência Local
-        RagEngine -->|"5. Prompt Injetado com Histórico + Contexto"| LLM["🦙 ChatOllama (Llama3)"]
+    subgraph Chat["Chat com memória"]
+        API -->|POST /chat| History{{"RedisChatMessageHistory\npor session_id"}}
+        Redis[("Redis")] <-.-> History
+        History --> Chain["RunnableWithMessageHistory\n(rag_chain)"]
+        Chroma -->|retriever MMR k=5| Chain
+        Chain --> Factory["llm_factory.get_llm(provider, model)"]
+        Factory --> LLM["Ollama / Gemini / Grok / Groq"]
+        LLM --> Chain
+        Chain -->|resposta + fontes| API
     end
-    
-    LLM -->|"6. Resposta"| Parser["StrOutputParser"]
-    Parser -->|"7. Retorna JSON com fontes e resposta"| API
-    API -->|"8. Renderiza no Chat"| User
+
+    API --> UI
 ```
 
-### Divisão de Camadas
+O Redis guarda apenas o histórico de mensagens da sessão (perguntas e respostas anteriores), não os vetores do documento. A cada chamada em `/chat`, `RunnableWithMessageHistory` busca esse histórico pelo `session_id`, injeta como `MessagesPlaceholder` no prompt, e a chain segue para o retriever do ChromaDB e depois para o LLM escolhido.
 
-| Camada | Tecnologia / Biblioteca | Função Principal |
-| :--- | :--- | :--- |
-| **Interface (UI)** | `Streamlit UI` | Chat interativo mantendo sessões isoladas. |
-| **Ponto de Entrada (API)** | `FastAPI` | Endpoints REST (`/chat`, `/upload_pdf`, `/health`) para consumo externo. |
-| **Orquestração** | `LangChain LCEL` | Declaração determinística de fluxo com `RunnableWithMessageHistory`. |
-| **Armazenamento de Memória** | `Redis` | Cache persistente e de alta velocidade para o histórico conversacional. |
-| **Base de Dados Vetorial** | `ChromaDB` | Armazenamento persistente local dos chunks indexados de PDFs. |
-| **Processamento Textual** | `PyMuPDF (fitz)` + `RecursiveTextSplitter` | Extração ultrarrápida de PDF e chunking inteligente (size=1000, overlap=100). |
-| **Motor de Inferência / Embeddings** | `Ollama` | Execução local e 100% on-premise do modelo de inferência (`llama3`) e embeddings (`nomic-embed-text`). |
+## Stack tecnológica
 
----
+| Componente | Tecnologia | Papel |
+|---|---|---|
+| Backend | FastAPI + Uvicorn | API REST (`src/main.py`) |
+| Frontend | Streamlit | Interface de chat e upload (`frontend/streamlit_app.py`) |
+| Orquestração de chain | LangChain (`langchain-core`, `langchain-community`) | Prompt, retriever, memória conversacional |
+| Banco vetorial | ChromaDB | Armazena embeddings dos chunks do PDF |
+| Memória de conversa | Redis (`RedisChatMessageHistory`) | Histórico de mensagens por `session_id` |
+| Embeddings | Ollama (`nomic-embed-text` por padrão) | Fixo — trocar invalidaria o índice vetorial |
+| LLM de geração | Ollama, Google Gemini, xAI Grok, Groq Cloud | Escolhido por provider via `llm_factory.py` |
+| Extração de PDF | PyMuPDF (`fitz`) | Leitura e split de texto do documento |
+| Configuração | python-dotenv | Variáveis de ambiente (`.env`) |
 
-## 🚀 Diferenciais Técnicos
+## Suporte multi-provider de LLM
 
-* **Persistência Concorrente via Redis:** O uso do Redis como cache chave-valor distribuído evita a perda de histórico com reinicializações do servidor e possibilita escalabilidade horizontal instantânea (múltiplas instâncias de API conectadas à mesma memória).
-* **Isolamento Total de Sessões (Multitenancy):** A RagEngine utiliza a factory pattern integrada com `session_id`, garantindo que nenhuma informação de um usuário vaze ou seja injetada no contexto de outro.
-* **Busca Vetorial MMR (Maximal Marginal Relevance):** Implementado `search_type="mmr"` (k=5, fetch_k=10) para obter maior diversidade de fontes nos documentos recuperados do ChromaDB, reduzindo redundâncias.
-* **Hermeticamente Testável (TDD):** Cobertura de teste com mocks completos de infraestrutura pesada, garantindo execuções de testes em menos de 0.1s.
+`src/core/llm_factory.py` é o único ponto do projeto que conhece as classes concretas de chat model. O resto do código (`rag_engine.py`, `main.py`) pede um LLM e recebe um `BaseChatModel` pronto, sem saber se é Ollama, Gemini, Grok ou Groq.
 
----
+**Providers suportados:**
 
-## 🛠️ Stack Tecnológica
+| Provider | Custo | Variável de chave | Modelo padrão |
+|---|---|---|---|
+| `ollama` | Zero — local | (nenhuma) | `llama3.2:3b` |
+| `gemini` | Pago (free tier limitado) | `GEMINI_API_KEY` ou `GOOGLE_API_KEY` | `gemini-2.5-flash` |
+| `grok` | Pago | `XAI_API_KEY` | `grok-4-latest` |
+| `groq` | Pago (free tier limitado) | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
 
-| Componente | Tecnologia | Versão Mínima |
-| :--- | :--- | :--- |
-| Linguagem | `Python` | `>= 3.12` |
-| Orquestrador de IA | `LangChain Core / Community / Ollama` | `>= 0.1.0` |
-| Banco de Dados Vetorial | `ChromaDB` | `>= 0.4.20` |
-| Persistência Conversacional | `Redis` | `>= 5.0.0` |
-| Extrator de PDF | `PyMuPDF (fitz)` | `>= 1.23.0` |
-| Framework de API | `FastAPI` | `>= 0.100.0` |
-| Interface Gráfica | `Streamlit` | `>= 1.30.0` |
+**Como trocar de motor:**
+- Via `.env`: `LLM_PROVIDER=gemini` define o padrão para todas as chamadas sem `provider` explícito.
+- Via requisição: o corpo de `POST /chat` aceita `provider` e `model` opcionais — o motor é resolvido e cacheado por essa combinação, sem afetar o motor padrão.
+- Via interface: o seletor lateral testa todos os providers configurados ao carregar a tela e só oferece os que responderam de fato.
 
----
+**Diagnóstico "configurado vs verificado":** `GET /providers` devolve, para cada provider, dois estados independentes:
+- `available` — a configuração está completa (SDK instalado, chave presente no `.env`). Não prova que o provider funciona.
+- `verified` — uma chamada real foi feita: `true` respondeu, `false` falhou, `null`/ausente nunca foi testada.
 
-## 💻 Como Rodar
+Ter chave e SDK não garante resposta: a conta pode estar sem crédito, a chave pode ter sido revogada, o modelo pode ter sido descontinuado. `GET /providers?probe=true` força uma chamada mínima (`"Responda apenas com a palavra: OK"`) a cada provider configurado e classifica qualquer falha numa categoria acionável (`sem_credito`, `chave_invalida`, `limite_taxa`, `modelo_inexistente`, `rede`, `desconhecido`), distinguindo essas falhas de uma falha de infraestrutura (Redis ou ChromaDB fora do ar), que não deve ser atribuída ao provider de LLM.
 
-### Pré-requisitos
-1. Ter o **Ollama** instalado localmente.
-2. Iniciar o modelo de LLM e Embeddings no terminal:
+Os SDKs de Gemini, Grok e Groq são importados sob demanda dentro de `llm_factory.py` — um provider não instalado não derruba os outros nem a inicialização do projeto. Eles não vêm fixados em `requirements.txt`; para usá-los, instale o pacote indicado na mensagem de erro (`langchain-google-genai`, `langchain-xai` ou `langchain-groq<1.0`).
+
+## Estrutura de pastas
+
+```
+PRJ-02_Memory_RAG/
+├── README.md
+├── requirements.txt
+├── docker-compose.standalone.yml     # Redis isolado, porta 6381
+├── debug_chroma.py                   # inspeção manual do ChromaDB
+├── frontend/
+│   ├── streamlit_app.py              # interface de chat e upload
+│   └── seletor_llm.py                # seletor de motor de LLM (testa providers)
+├── src/
+│   ├── main.py                       # FastAPI: rotas da API
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── schemas.py                # QueryRequest, QueryResponse, HealthResponse
+│   └── core/
+│       ├── __init__.py
+│       ├── rag_engine.py             # RagEngine: chain RAG + memória via Redis
+│       └── llm_factory.py            # fábrica multi-provider de LLM
+├── scripts/
+│   ├── verify_env.py                 # checa dependências instaladas
+│   └── test_memory_api.py            # smoke test manual contra a API real
+└── tests/
+    ├── test_rag.py
+    ├── test_llm_factory.py
+    └── test_provider_health.py
+```
+
+## Como rodar
+
+### Local — standalone (sem o PRJ-09)
+
+1. Ambiente virtual e dependências:
    ```bash
-   ollama pull llama3
-   ollama pull nomic-embed-text
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
    ```
-3. Ter o **Docker** ou um servidor **Redis** local ativo na porta `6379`.
 
-### 1. Inicializar o Redis em Container Docker
+2. Suba o Redis isolado (porta 6381 — a 6380 é reservada ao Redis compartilhado do PRJ-09):
+   ```bash
+   docker compose -f docker-compose.standalone.yml up -d
+   ```
+
+3. Configure o `.env` (veja as chaves usadas em `src/core/llm_factory.py` e `src/core/rag_engine.py`):
+   ```env
+   OLLAMA_HOST=http://localhost:11434
+   MODEL_NAME=llama3
+   EMBEDDING_MODEL_NAME=nomic-embed-text
+   REDIS_URL=redis://localhost:6381
+   LLM_PROVIDER=ollama
+   # Opcionais, só necessários para os providers pagos:
+   GEMINI_API_KEY=
+   XAI_API_KEY=
+   GROQ_API_KEY=
+   ```
+
+4. Com o Ollama em execução, suba a API:
+   ```bash
+   uvicorn src.main:app --reload --port 8000
+   ```
+
+5. Em outro terminal, suba a interface:
+   ```bash
+   streamlit run frontend/streamlit_app.py
+   ```
+
+### Via Docker / PRJ-09 (orquestrado)
+
+O PRJ-09 é o orquestrador do ecossistema: sobe o Redis compartilhado na porta 6380 (usado por PRJ-02 e PRJ-03) e um container de API e um de UI para cada projeto RAG. A partir da pasta do PRJ-09:
+
 ```bash
-docker run -d --name redis-memory-rag -p 6379:6379 redis:7-alpine
+docker compose up -d
 ```
 
-### 2. Clonar e Instalar Dependências
+Isso publica a API do PRJ-02 em `localhost:8002` e a interface em `localhost:8502`, com `REDIS_URL` já apontado para o Redis do compose (`redis://redis:6379`) e `API_URL` da UI apontado para o container da API (`http://prj-02-api:8000`) — por isso o frontend lê `API_URL` de variável de ambiente em vez de um valor fixo.
+
+## Referência da API
+
+| Método | Rota | Descrição |
+|---|---|---|
+| `GET` | `/` | Mensagem de boas-vindas |
+| `GET` | `/health` | Status da engine (LLM e ChromaDB) |
+| `GET` | `/providers` | Diagnóstico dos motores de LLM. `?probe=true` faz uma chamada real a cada um |
+| `POST` | `/upload_pdf` | Upload de PDF; extrai, faz chunking e indexa no ChromaDB |
+| `POST` | `/chat` | Pergunta + `session_id` (+ `provider`/`model` opcionais); resposta com fontes |
+| `GET` | `/list_docs` | Lista os documentos indexados |
+| `DELETE` | `/remove_doc?filename=` | Remove um documento do índice e do disco |
+| `POST` | `/clear_db` | Apaga toda a base vetorial e os uploads |
+
+## Testes
+
 ```bash
-git clone https://github.com/wganalytics/rag-memory-redis-giulia-ai.git
-cd rag-memory-redis-giulia-ai
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pytest tests/ -q
 ```
 
-### 3. Configurar Variáveis de Ambiente (`.env`)
-Crie um arquivo `.env` na raiz do projeto:
-```env
-REDIS_URL=redis://localhost:6379
-OLLAMA_HOST=http://localhost:11434
-MODEL_NAME=llama3
-EMBEDDING_MODEL_NAME=nomic-embed-text
-```
+54 testes passando, cobrindo resolução de provider/modelo, a fábrica de LLM (`llm_factory.py`), a classificação de falhas de providers (`test_provider_health.py`) e a chain do RAG com dependências pesadas (LangChain, gRPC, PyMuPDF) mockadas via `sys.modules` para manter a suíte rápida e hermética.
 
-### 4. Executar o Backend API (FastAPI)
-```bash
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-```
-Acesse a documentação interativa em `http://localhost:8000/docs`.
+`scripts/test_memory_api.py` é um smoke test manual à parte, que bate na API real (não faz parte da suíte automatizada).
 
-### 5. Executar o Frontend UI (Streamlit)
-Em outro terminal com a `.venv` ativa:
-```bash
-streamlit run frontend/streamlit_app.py
-```
-Acesse `http://localhost:8501` para interagir visualmente com a interface de chat.
+## Limitações conhecidas / decisões de engenharia
 
----
-
-## 🧪 Suíte de Testes (TDD)
-
-O projeto foi inteiramente concebido sob a metodologia **Test-Driven Development (TDD)**. Os testes mockam a camada física pesada de gRPC e banco de dados usando `unittest.mock` e manipulação de `sys.modules`, garantindo execuções de testes em menos de 0.1 segundos em pipelines de CI.
-
-Para rodar os testes unitários:
-```bash
-python3 -m pytest tests/test_rag.py -v
-```
-
-### Validações efetuadas:
-* `test_redis_connection`: Conexão segura e correta da factory com a URL do Redis.
-* `test_memory_persistence`: Persistência real de mensagens na chain LCEL.
-* `test_session_isolation`: Garantia de isolamento hermético entre sessões concorrentes A e B.
-* `test_chromadb_health`: Checagem e leitura saudável no banco vetorial.
-* `test_rag_pipeline_empty`: Comportamento seguro com fallbacks se não houver contexto indexado.
-* `test_pdf_ingestion`: Ingestão, leitura por PyMuPDF, chunking e inserção no ChromaDB.
-* `test_mmr_diversity`: Deduplicação de fontes repetidas utilizando lógica de Maximal Marginal Relevance.
-
----
-
-## 📈 Métricas Reais do Projeto
-
-| Métrica | Valor Real |
-| :--- | :--- |
-| **Linhas de Código** | `887` |
-| **Arquivos Python** | `10` |
-| **Cobertura de Testes (Pytest)** | `7 passados / 0.07 segundos` |
-| **Tempo de Recuperação de Sessão (Redis)** | `< 0.05 segundos` |
-| **Eficiência de Ingestão de PDF** | `~120 páginas por segundo` |
-| **Progresso no Backlog (Jira GARE-39)** | `100% (6/6 concluídas)` |
-
----
-
-## 🌐 Projetos do Ecossistema GIULIA AI
-
-Esta implementação faz parte da suíte modular de engenharia avançada de RAG e Agentes da **Giulia AI**:
-
-| Projeto | Arquitetura | Diferencial Técnico |
-| :--- | :--- | :--- |
-| [PRJ-01](https://github.com/wganalytics/vanilla-rag-giulia-ai) | **Vanilla RAG** | Baseline 100% local com extração ultrarrápida via PyMuPDF e ChromaDB. |
-| **PRJ-02** (Este) | **Memory RAG** | Persistência distributiva conversacional por sessões isoladas via Redis. |
-| [PRJ-03](https://github.com/wganalytics/agentic-rag-giulia-ai) | **Agentic RAG** | RAG orquestrado por Agentes Inteligentes com tomada de decisões em tempo real. |
-
----
-
-## ✒️ Autor
-
-Criado por **Wemerson G. A.**.
-Conecte-se comigo para debater arquiteturas avançadas de IA e sistemas baseados em agentes:
-
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/wganalytics)
-[![GitHub](https://img.shields.io/badge/GitHub-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/wganalytics)
-
----
-
-*Construído com engenharia real. Sem vibe coding.*
+- **Sessão de memória sem expiração automática configurada no código.** `RedisChatMessageHistory` persiste o histórico indefinidamente por `session_id`; não há TTL definido no projeto — cabe a quem opera o Redis definir uma política de expiração se necessário.
+- **`session_id` é responsabilidade do cliente.** A API confia no valor recebido; não há autenticação nem isolamento entre usuários além do próprio identificador de sessão.
+- **SDKs de providers pagos não estão em `requirements.txt`.** Ficam fora do pin do projeto de propósito — cada um só é importado se o provider correspondente for usado, e o erro de import já indica o comando de instalação.
+- **`/providers?probe=true` gasta uma chamada real (e crédito) por provider configurado.** Está sem retry deliberadamente (`max_retries=0`), para não travar a tela no backoff de um 429; em compensação, um probe repetido pode contar contra o limite de requisições de free tier.
+- **Fontes citadas vêm de uma segunda consulta ao retriever, fora da chain de memória.** `query()` roda a chain conversacional e, separadamente, invoca o retriever de novo só para montar a lista de fontes — funciona porque o retriever é determinístico, mas significa duas buscas vetoriais por pergunta.
+- **Retenção da chave `OPENAI_API_KEY` no `.env`** é herdada do PRJ-01 mas não é usada por nenhum provider deste projeto — nenhum builder em `llm_factory.py` a referencia.

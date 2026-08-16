@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import requests
 
@@ -10,7 +11,11 @@ st.set_page_config(
     layout="centered" # Layout centralizado fica mais legível para chat
 )
 
-API_URL = "http://127.0.0.1:8000"
+# Em container a API vive noutro host: o padrao preserva o uso local.
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+
+from seletor_llm import selecionar_motor  # mesma pasta do app (Streamlit poe no path)
+_provider, _modelo = selecionar_motor(API_URL)
 
 # -------------------------------------------------------------
 # UI: CASCATA LATERAL (SIDEBAR) - Área de Controles e Upload
@@ -132,7 +137,7 @@ if prompt := st.chat_input("Pergunte algo sobre o documento armazenado..."):
     with st.chat_message("assistant"):
         with st.spinner("Refletindo sobre o documento..."):
             try:
-                response = requests.post(f"{API_URL}/chat", json={"question": prompt})
+                response = requests.post(f"{API_URL}/chat", json={"question": prompt, "provider": _provider, "model": _modelo}, timeout=300)
                 if response.status_code == 200:
                     chat_data = response.json()
                     answer = chat_data["answer"]
