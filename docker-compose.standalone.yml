@@ -1,0 +1,40 @@
+# Redis isolado para rodar o PRJ-02 SOZINHO, sem o PRJ-09.
+#
+# POR QUE ESTE ARQUIVO NÃO SE CHAMA MAIS docker-compose.yml
+#
+# O PRJ-09 (Deploy Cloud) subiu para ser o dono da infraestrutura do
+# ecossistema e publica um Redis em 6380 — exatamente a porta que este arquivo
+# usava. Rodar os dois derrubava um deles com "port is already allocated", e o
+# nome padrão fazia isso acontecer sem ninguém pedir.
+#
+# Agora:
+#   - PRJ-09 é o caminho normal e mantém a porta canônica 6380.
+#   - Este arquivo é o caminho isolado, na porta 6381, e só sobe se for
+#     chamado explicitamente.
+#
+# COMO USAR
+#
+#   docker compose -f docker-compose.standalone.yml up -d
+#
+# E aponte o .env deste projeto para a porta alternativa:
+#
+#   REDIS_URL=redis://localhost:6381
+#
+# Para voltar ao modo orquestrado, use redis://localhost:6380 (PRJ-09).
+#
+# Observação: o PRJ-03 também usa Redis e não tem compose próprio — ele conta
+# com o 6380 do PRJ-09.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: prj02_redis_standalone
+    ports:
+      - "6381:6379"   # 6380 pertence ao PRJ-09
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+volumes:
+  redis_data:
